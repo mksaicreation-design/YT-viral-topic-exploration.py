@@ -58,7 +58,38 @@ with st.sidebar:
     )
     days = st.slider("Published within the last (days)", 1, 30, 7)
     max_per_keyword = st.slider("Results per keyword", 5, 50, 10, step=5)
-    max_subscribers = st.number_input("Maximum channel subscribers", min_value=0, value=3000, step=500)
+    subscriber_limit_choice = st.selectbox(
+        "Maximum channel subscribers",
+        ["3,000 (recommended)", "1,000", "5,000", "10,000", "No limit", "Custom"],
+        index=0,
+        help="Choose a preset limit, remove the limit, or enter your own number.",
+    )
+    if subscriber_limit_choice == "No limit":
+        max_subscribers = 0
+    elif subscriber_limit_choice == "Custom":
+        max_subscribers = int(st.number_input(
+            "Enter subscriber limit",
+            min_value=1,
+            max_value=1000000000,
+            value=3000,
+            step=500,
+        ))
+    else:
+        max_subscribers = int(subscriber_limit_choice.split()[0].replace(",", ""))
+
+    hidden_subscriber_option = st.selectbox(
+        "Channels with hidden subscriber counts",
+        [
+            "Exclude hidden subscriber channels (recommended)",
+            "Include hidden subscriber channels",
+        ],
+        index=0,
+        help="A hidden subscriber count cannot be checked against a numeric limit. Hidden-count channels can only be included when Maximum channel subscribers is set to No limit.",
+    )
+    include_hidden_subscribers = hidden_subscriber_option.startswith("Include")
+    if include_hidden_subscribers and max_subscribers > 0:
+        st.info("Hidden-subscriber channels will be excluded while a numeric subscriber limit is active. Select No limit to include them.")
+
     min_views = st.number_input("Minimum views", min_value=0, value=1000, step=500)
     region = st.selectbox("Region", ["Worldwide", "United Kingdom", "United States", "Canada", "Australia", "India"])
     region_codes = {"Worldwide": None, "United Kingdom": "GB", "United States": "US", "Canada": "CA", "Australia": "AU", "India": "IN"}
@@ -107,7 +138,7 @@ def chunks(items, size=50):
     for i in range(0, len(items), size):
         yield items[i:i + size]
 
-def fetch_research(api_key, keywords, days, max_per_keyword, max_subscribers, min_views, region_code, language):
+def fetch_research(api_key, keywords, days, max_per_keyword, max_subscribers, min_views, region_code, language, include_hidden_subscribers):
     published_after = (datetime.now(timezone.utc) - timedelta(days=days)).isoformat(timespec="seconds").replace("+00:00", "Z")
     raw_videos = {}
     progress = st.progress(0, text="Preparing searches…")
@@ -189,7 +220,11 @@ def fetch_research(api_key, keywords, days, max_per_keyword, max_subscribers, mi
         })
     df = pd.DataFrame(rows).drop_duplicates(subset=["Video ID"])
     if max_subscribers > 0:
+        # Hidden subscriber counts cannot be verified against a numeric limit.
         df = df[df["Subscribers"].notna() & (df["Subscribers"] < max_subscribers)]
+    elif not include_hidden_subscribers:
+        # With no numeric limit, the user can still choose to exclude hidden counts.
+        df = df[df["Subscribers"].notna()]
     return df[df["Views"] >= min_views]
 
 if st.button("🔎 Fetch viral topic candidates", type="primary", use_container_width=True):
@@ -202,7 +237,7 @@ if st.button("🔎 Fetch viral topic candidates", type="primary", use_container_
             with st.spinner("Collecting YouTube video and channel data…"):
                 result_df = fetch_research(
                     api_key.strip(), keywords, days, max_per_keyword, int(max_subscribers),
-                    int(min_views), region_codes[region], language
+                    int(min_views), region_codes[region], language, include_hidden_subscribers
                 )
             st.session_state["viral_results"] = result_df
             st.session_state["viral_category"] = selected_category
