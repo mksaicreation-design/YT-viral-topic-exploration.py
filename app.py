@@ -1,4 +1,5 @@
 import os
+import hashlib
 from datetime import datetime, timedelta, timezone
 
 import pandas as pd
@@ -46,7 +47,7 @@ CATEGORY_KEYWORDS = {
 
 st.set_page_config(page_title="YouTube Viral Topics Tool", page_icon="📈", layout="wide")
 st.title("📈 YouTube Viral Topics Research Tool")
-st.caption("Discover recent YouTube videos, compare performance, and export research results.")
+st.caption("Discover recent YouTube videos, rank topic opportunities, create original-script prompts, and export research results.")
 
 with st.sidebar:
     st.header("Search settings")
@@ -235,7 +236,33 @@ def fetch_research(api_key, keywords, days, max_per_keyword, max_subscribers, mi
     elif not include_hidden_subscribers:
         # With no numeric limit, the user can still choose to exclude hidden counts.
         df = df[df["Subscribers"].notna()]
-    return df[df["Views"] >= min_views]
+    df = df[df["Views"] >= min_views].copy()
+    if df.empty:
+        return df
+
+    # Relative heuristics calculated only among the videos returned by this search.
+    views_day_pct = df["Views/day"].rank(pct=True).fillna(0)
+    ratio_pct = df["Views/subscribers"].rank(pct=True).fillna(0.5)
+    freshness_pct = (1 - df["Age (days)"].rank(pct=True)).fillna(0)
+    df["Viral Potential Score"] = (
+        100 * (0.50 * views_day_pct + 0.35 * ratio_pct + 0.15 * freshness_pct)
+    ).round().astype(int)
+
+    # Competition proxy: number of candidate videos associated with each keyword.
+    keyword_counts = df.groupby("Keyword")["Video ID"].transform("count")
+    df["Observed topic results"] = keyword_counts.astype(int)
+    count_rank = keyword_counts.rank(pct=True)
+    df["Topic competition"] = count_rank.map(
+        lambda p: "Low" if p <= 1/3 else ("Medium" if p <= 2/3 else "High")
+    )
+    df["Opportunity Score"] = (
+        100 * (0.65 * (df["Viral Potential Score"] / 100) + 0.35 * (1 - count_rank))
+    ).round().astype(int)
+    df["Opportunity label"] = df["Opportunity Score"].map(
+        lambda score: "Strong opportunity" if score >= 70
+        else ("Worth testing" if score >= 45 else "Lower signal / review carefully")
+    )
+    return df
 
 if st.button("🔎 Fetch viral topic candidates", type="primary", use_container_width=True):
     if not api_key.strip():
@@ -265,8 +292,13 @@ results = st.session_state.get("viral_results")
 if isinstance(results, pd.DataFrame) and not results.empty:
     st.divider()
     st.subheader(f"Results: {st.session_state.get('viral_category', selected_category)}")
-    sort_by = st.selectbox("Sort results by", ["Viral score", "Views", "Views/day", "Views/subscribers", "Newest"])
+    sort_by = st.selectbox(
+        "Sort results by",
+        ["Opportunity Score", "Viral Potential Score", "Viral score", "Views", "Views/day", "Views/subscribers", "Newest"],
+    )
     sort_map = {
+        "Opportunity Score": ("Opportunity Score", False),
+        "Viral Potential Score": ("Viral Potential Score", False),
         "Viral score": ("Viral score", False), "Views": ("Views", False),
         "Views/day": ("Views/day", False), "Views/subscribers": ("Views/subscribers", False),
         "Newest": ("Published", False),
@@ -279,8 +311,39 @@ if isinstance(results, pd.DataFrame) and not results.empty:
     c.metric("Median views/day", f"{shown['Views/day'].median():,.0f}")
     ratios = shown["Views/subscribers"].dropna()
     d.metric("Median views/subscribers", f"{ratios.median():.2f}×" if not ratios.empty else "N/A")
+    st.markdown("### Topic ideas ranked by opportunity")
+    st.caption(
+        "Scores are estimates relative to this search result set, not official YouTube metrics. "
+        "Observed competition counts only the filtered candidate videos found for a keyword; "
+        "it does not measure all competition on YouTube."
+    )
+    keyword_summary = (
+        shown.groupby("Keyword", dropna=False)
+        .agg(
+            Candidate_videos=("Video ID", "count"),
+            Median_views_per_day=("Views/day", "median"),
+            Median_viral_potential=("Viral Potential Score", "median"),
+            Median_opportunity=("Opportunity Score", "median"),
+            Competition=("Topic competition", lambda values: values.mode().iloc[0] if not values.mode().empty else "Medium"),
+        )
+        .reset_index()
+        .sort_values(["Median_opportunity", "Median_views_per_day"], ascending=False)
+        .rename(columns={
+            "Keyword": "Topic keyword",
+            "Candidate_videos": "Candidate videos",
+            "Median_views_per_day": "Median views/day",
+            "Median_viral_potential": "Median viral potential",
+            "Median_opportunity": "Opportunity score",
+            "Competition": "Observed competition",
+        })
+    )
+    st.dataframe(keyword_summary, use_container_width=True, hide_index=True)
+
+    st.markdown("### Video candidates")
     st.dataframe(
-        shown[["Title", "Channel", "Published", "Views", "Views/day", "Subscribers", "Views/subscribers", "Viral score", "Keyword", "URL"]],
+        shown[["Title", "Channel", "Published", "Views", "Views/day", "Subscribers",
+               "Views/subscribers", "Viral score", "Viral Potential Score",
+               "Topic competition", "Opportunity Score", "Opportunity label", "Keyword", "URL"]],
         use_container_width=True, hide_index=True,
         column_config={
             "URL": st.column_config.LinkColumn("Watch", display_text="Open video"),
@@ -289,8 +352,116 @@ if isinstance(results, pd.DataFrame) and not results.empty:
             "Views/day": st.column_config.NumberColumn(format="%.1f"),
             "Views/subscribers": st.column_config.NumberColumn(format="%.2f×"),
             "Viral score": st.column_config.NumberColumn(format="%.2f"),
+            "Viral Potential Score": st.column_config.NumberColumn(format="%d/100"),
+            "Opportunity Score": st.column_config.NumberColumn(format="%d/100"),
         },
     )
+    st.divider()
+    st.subheader("3. Create an original-script prompt for ChatGPT")
+    st.write(
+        "Choose a promising topic and create a ready-to-paste prompt. The prompt uses public metadata "
+        "as research context, not as material to copy or rewrite."
+    )
+    topic_options = keyword_summary["Topic keyword"].tolist()
+    chosen_topic = st.selectbox("Choose a topic for your video", topic_options, key="prompt_topic")
+    prompt_col1, prompt_col2, prompt_col3 = st.columns(3)
+    with prompt_col1:
+        target_language = st.selectbox("Script language", ["English", "Urdu", "English + Urdu"], index=0)
+        target_duration = st.selectbox("Video duration", ["60-second Short", "3 minutes", "5 minutes", "8 minutes", "10 minutes"], index=2)
+    with prompt_col2:
+        target_style = st.selectbox("Video style", ["Documentary", "Explainer", "Mystery storytelling", "Top facts", "Educational storytelling"])
+        target_audience = st.selectbox("Target audience", ["General audience", "Beginners", "Space and science fans", "History fans", "Families"])
+    with prompt_col3:
+        voice_style = st.selectbox("Narration tone", ["Clear and engaging", "Cinematic documentary", "Warm and conversational", "Suspenseful but factual"])
+        include_shorts = st.checkbox("Also suggest a Shorts version", value=True)
+    unique_angle = st.text_input(
+        "Your preferred unique angle (optional)",
+        placeholder="e.g. explain what most videos miss, with verified facts and a strong opening",
+    )
+
+    topic_rows = shown[shown["Keyword"] == chosen_topic].sort_values("Opportunity Score", ascending=False).head(5)
+    refs = []
+    for _, refrow in topic_rows.iterrows():
+        refs.append(
+            f"- Title: {refrow['Title']} | Channel: {refrow['Channel']} | "
+            f"Views: {int(refrow['Views']):,} | Views/day: {refrow['Views/day']} | "
+            f"Published: {refrow['Published']} | URL: {refrow['URL']}"
+        )
+    reference_block = "\\n".join(refs) if refs else "No candidate video metadata available."
+    prompt_text = f"""You are an expert YouTube researcher, fact-checker, and original scriptwriter.
+
+TASK
+Create an ORIGINAL YouTube video concept and script about: {chosen_topic}
+Selected category: {st.session_state.get('viral_category', selected_category)}
+Language: {target_language}
+Target duration: {target_duration}
+Format: {target_style}
+Audience: {target_audience}
+Narration tone: {voice_style}
+Optional unique angle: {unique_angle.strip() or "Choose a distinctive angle that adds value beyond common summaries."}
+
+REFERENCE RESEARCH (metadata only; use as topic signals, not as text to copy)
+{reference_block}
+
+STRICT ORIGINALITY AND ACCURACY RULES
+1. Do not copy, closely paraphrase, or imitate the wording, structure, jokes, distinctive framing, or narration of the reference videos.
+2. Do not assume that video titles or view counts prove a factual claim. Verify important factual claims using reliable primary or authoritative sources, and provide source links.
+3. If a fact cannot be verified, label it as uncertain or omit it. Never invent quotes, studies, dates, or statistics.
+4. Develop a fresh thesis, structure, examples, and transitions. Do not reproduce any reference video's transcript.
+5. Do not include copyrighted footage, music, images, or other assets unless the user has rights or a suitable licence. Suggest original visuals, public-domain materials, or properly licensed assets and identify any licensing checks needed.
+6. Do not guarantee that the script is copyright-free or that it cannot receive a claim. Flag legal uncertainty for human review.
+
+DELIVERABLES
+A. Explain why this topic may interest viewers, distinguishing observed signals from speculation.
+B. Give 3 original title options and 3 thumbnail concepts.
+C. Write a compelling opening hook, then a complete timed script with narration, scene/visual suggestions, and on-screen text.
+D. Add a fact-check table: claim, source URL, confidence, and whether further verification is needed.
+E. Provide a list of original visual prompts and sound-design suggestions that avoid copying reference assets.
+F. Add a pre-publication checklist for factual accuracy, originality, licences, music, and platform policies.
+{"Also create a separate 30–60 second Shorts adaptation with a distinct hook and wording." if include_shorts else "Do not create a Shorts adaptation unless requested separately."}
+
+Return practical, production-ready output. Clearly separate verified facts, creative suggestions, and items requiring human review."""
+    prompt_widget_key = "generated_script_prompt_" + hashlib.sha256(prompt_text.encode("utf-8")).hexdigest()[:12]
+    st.text_area("Generated ChatGPT prompt", value=prompt_text, height=320, key=prompt_widget_key)
+    st.download_button(
+        "⬇️ Download ChatGPT script prompt (TXT)",
+        data=prompt_text.encode("utf-8"),
+        file_name="chatgpt_original_script_prompt.txt",
+        mime="text/plain",
+        use_container_width=True,
+    )
+
+    with st.expander("Quality & copyright review checklist"):
+        st.caption(
+            "This is a human review checklist, not a legal opinion or automated copyright detector. "
+            "It cannot guarantee that a video will avoid claims."
+        )
+        review_items = [
+            "The script has a distinct thesis, structure, and wording.",
+            "Important facts have reliable source links and have been checked.",
+            "No reference transcript, distinctive phrasing, or creator-specific style was copied.",
+            "Every image, clip, music track, sound effect, and font has a documented licence or permission.",
+            "AI-generated content has been reviewed for factual errors and misleading depictions.",
+            "Titles and thumbnails accurately represent the video.",
+            "The final script and assets have been reviewed by a human before publishing.",
+        ]
+        for item in review_items:
+            st.checkbox(item, key="review_" + str(review_items.index(item)))
+
+    with st.expander("Plugin Manager — future automation connectors"):
+        st.info(
+            "Manual workflow is active. This section is an extension point only; no external AI or video-generation plugin is connected yet."
+        )
+        st.markdown(
+            "- **ChatGPT Prompt Export:** Available now; copy or download the generated prompt.\n"
+            "- **OpenAI API Script Writer:** Planned plugin; requires an OpenAI API key and API usage billing.\n"
+            "- **Research/Fact-check Connector:** Planned plugin; should return source URLs and confidence notes.\n"
+            "- **Voice-over Connector:** Planned plugin for a provider such as ElevenLabs.\n"
+            "- **Video Generation/Editing Connector:** Planned plugin for licensed assets and supported providers.\n\n"
+            "Future connectors should be installed and configured individually, with API keys stored in Streamlit Secrets rather than source code."
+        )
+
+    st.divider()
     st.download_button(
         "⬇️ Download results as CSV",
         data=shown.to_csv(index=False).encode("utf-8-sig"),
@@ -311,6 +482,9 @@ else:
     st.markdown(
         "- **Views/day:** total views divided by the approximate age of the video.\n"
         "- **Views/subscribers:** compares video views with channel subscriber count.\n"
-        "- **Viral score:** a heuristic for sorting candidates, not an official YouTube metric."
+        "- **Viral score:** a heuristic for sorting candidates, not an official YouTube metric.\\n"
+        "- **Viral Potential Score (0–100):** a relative score using views/day, views/subscribers, and recency within this result set.\\n"
+        "- **Topic competition:** a low/medium/high proxy based on filtered candidate counts per keyword, not the whole YouTube market.\\n"
+        "- **Opportunity Score (0–100):** combines the relative viral score with the inverse of the observed competition proxy."
     )
     st.caption("Search results depend on your keywords, region, selected date range, YouTube API quota, and public data availability.")
