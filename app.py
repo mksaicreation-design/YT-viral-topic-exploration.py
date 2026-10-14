@@ -58,24 +58,34 @@ with st.sidebar:
     )
     days = st.slider("Published within the last (days)", 1, 30, 7)
     max_per_keyword = st.slider("Results per keyword", 5, 50, 10, step=5)
-    subscriber_limit_choice = st.selectbox(
-        "Maximum channel subscribers",
-        ["3,000 (recommended)", "1,000", "5,000", "10,000", "No limit", "Custom"],
+    subscriber_limit_mode = st.radio(
+        "Subscriber limit mode",
+        ["Use a limit", "No limit"],
+        horizontal=True,
         index=0,
-        help="Choose a preset limit, remove the limit, or enter your own number.",
+        help="Choose a maximum subscriber count, or remove the subscriber limit entirely.",
     )
-    if subscriber_limit_choice == "No limit":
+    if subscriber_limit_mode == "No limit":
         max_subscribers = 0
-    elif subscriber_limit_choice == "Custom":
-        max_subscribers = int(st.number_input(
-            "Enter subscriber limit",
+    else:
+        subscriber_limit_choice = st.selectbox(
+            "Maximum channel subscribers",
+            ["3,000 (recommended)", "1,000", "5,000", "10,000", "Custom (enter below)"],
+            index=0,
+            help="Choose a preset limit or enter your own number below.",
+        )
+        custom_subscriber_limit = st.number_input(
+            "Custom maximum subscribers",
             min_value=1,
             max_value=1000000000,
             value=3000,
             step=500,
-        ))
-    else:
-        max_subscribers = int(subscriber_limit_choice.split()[0].replace(",", ""))
+            help="This field is always available when 'Use a limit' is selected. It is used only when 'Custom (enter below)' is selected.",
+        )
+        if subscriber_limit_choice == "Custom (enter below)":
+            max_subscribers = int(custom_subscriber_limit)
+        else:
+            max_subscribers = int(subscriber_limit_choice.split()[0].replace(",", ""))
 
     hidden_subscriber_option = st.selectbox(
         "Channels with hidden subscriber counts",
@@ -84,7 +94,7 @@ with st.sidebar:
             "Include hidden subscriber channels",
         ],
         index=0,
-        help="A hidden subscriber count cannot be checked against a numeric limit. Hidden-count channels can only be included when Maximum channel subscribers is set to No limit.",
+        help="Hidden subscriber counts cannot be compared with a numeric limit. To include these channels, select No limit and then choose Include hidden subscriber channels.",
     )
     include_hidden_subscribers = hidden_subscriber_option.startswith("Include")
     if include_hidden_subscribers and max_subscribers > 0:
